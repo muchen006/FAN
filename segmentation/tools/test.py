@@ -22,7 +22,6 @@ from mmseg.datasets import build_dataloader, build_dataset
 from mmseg.models import build_segmentor
 from IPython import embed
 
-# test smart_git
 
 def parse_args():
     parser = argparse.ArgumentParser(
