@@ -81,7 +81,7 @@ def conv3x3(in_planes, out_planes, stride=1):
     """3x3 convolution + batch norm"""
     return torch.nn.Sequential(
         nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False),
-        nn.SyncBatchNorm(out_planes)
+        nn.BatchNorm2d(out_planes)
     )
 
 
@@ -120,6 +120,32 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+# Add MMM Class
+class MMM(nn.Module):
+
+    def __init__(self,
+                 in_features,
+                 hidden_features=None,
+                 out_features=None,
+                 act_layer=nn.GELU,
+                 drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.dwconv = DWConv2(hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, in_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x, H, W):
+        x = self.fc1(x)
+        x = self.dwconv(x, H, W)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
 
 class ClassAttn(nn.Module):
     # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
@@ -200,6 +226,20 @@ class ConvPatchEmbed(nn.Module):
         x = x.flatten(2).transpose(1, 2)  # (B, N, C)
         return x, (Hp, Wp)
 
+# Add DWConv2 Class
+class DWConv2(nn.Module):
+
+    def __init__(self, dim):
+        super(DWConv2, self).__init__()
+        self.dwconv = nn.Conv2d(dim, dim, 3, 1, 1, bias=True, groups=dim)
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        x = x.transpose(1, 2).contiguous().view(B, C, H, W)
+        x = self.dwconv(x)
+        x = x.flatten(2).transpose(1, 2).contiguous()
+
+        return x
 
 class DWConv(nn.Module):
 
@@ -212,7 +252,7 @@ class DWConv(nn.Module):
         self.conv1 = torch.nn.Conv2d(
             in_features, in_features, kernel_size=kernel_size, padding=padding, groups=in_features)
         self.act = act_layer()
-        self.bn = nn.SyncBatchNorm(in_features)
+        self.bn = nn.BatchNorm2d(in_features)
         self.conv2 = torch.nn.Conv2d(
             in_features, out_features, kernel_size=kernel_size, padding=padding, groups=out_features)
 
@@ -431,14 +471,22 @@ class ChannelProcessing(nn.Module):
         return {'temperature'}
 
 class FANBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., drop_path=0., norm_layer=nn.LayerNorm, eta=1.):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, eta=1.):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = TokenMixing(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
-
-        mlp_block = ChannelProcessing 
+        # Add Conv Positional Encoding starts
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.norm3 = norm_layer(dim)
+        self.mmm = MMM(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            act_layer=act_layer,
+            drop=drop)
+        # Add Conv Positional Encoding ends
+        mlp_block = ChannelProcessing
         self.mlp = mlp_block(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop,
                                         drop_path=drop_path, drop=drop, mlp_hidden_dim = int(dim * mlp_ratio))
 
@@ -450,9 +498,11 @@ class FANBlock(nn.Module):
     def forward(self, x, attn=None, return_attention=False):
         H, W = self.H, self.W
         x_new, attn = self.attn(self.norm1(x), H, W)
-        x = x + self.drop_path(self.gamma1 * x_new)
+        x = x + self.drop_path(self.gamma1 * x_new) #shortcut
         x_new, attn = self.mlp(self.norm2(x), H, W, atten=attn)
-        x = x + self.drop_path(self.gamma2 * x_new)
+        x = x + self.drop_path(self.gamma2 * x_new) #shortcut
+        # Add Conv Positional Encoding
+        x = x + self.drop_path(self.mmm(self.norm3(x), H, W))
         self.H, self.W = H, W
         if return_attention:
             return attn
@@ -485,7 +535,7 @@ class FAN(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.use_pos_embed = use_pos_embed
         if use_pos_embed:
-            self.pos_embed = PositionalEncodingFourier(dim=embed_dim)
+            self.pos_embed = PositionalEncodingFourier(dim=embed_dim) # instantiate the class PositionalEncodingFourier
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         build_block = FANBlock
@@ -551,12 +601,12 @@ class FAN(nn.Module):
         else:
             x, (Hp, Wp) = self.patch_embed(x)
 
-        if self.use_pos_embed:
-            # `pos_embed` (B, C, Hp, Wp), reshape -> (B, C, N), permute -> (B, N, C)
-            pos_encoding = self.pos_embed(B, Hp, Wp).reshape(B, -1, x.shape[1]).permute(0, 2, 1)
-            x = x + pos_encoding
-
-        x = self.pos_drop(x)
+        # if self.use_pos_embed:
+        #     # `pos_embed` (B, C, Hp, Wp), reshape -> (B, C, N), permute -> (B, N, C)
+        #     pos_encoding = self.pos_embed(B, Hp, Wp).reshape(B, -1, x.shape[1]).permute(0, 2, 1)
+        #     x = x + pos_encoding
+        #
+        # x = self.pos_drop(x)
 
         for idx, blk in enumerate(self.blocks):
             blk.H, blk.W = Hp, Wp

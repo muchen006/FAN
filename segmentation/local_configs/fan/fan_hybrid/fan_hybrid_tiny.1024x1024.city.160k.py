@@ -16,7 +16,7 @@ norm_cfg = dict(type='SyncBN', requires_grad=True)
 find_unused_parameters = True
 model = dict(
     type='EncoderDecoder',
-    # pretrained='pretrained/fan_tiny_8_p4_hybrid.pth.tar',
+    pretrained='pretrained/fan_hybrid_tiny.pth.tar',
     backbone=dict(
         type='fan_tiny_8_p4_hybrid',
         style='pytorch'),
